@@ -1,5 +1,14 @@
-import { Plugin, Notice, Setting, PluginSettingTab, App } from "obsidian";
+import {
+	Plugin,
+	Notice,
+	Setting,
+	PluginSettingTab,
+	App,
+	TFile,
+} from "obsidian";
 import simpleGit, { SimpleGit } from "simple-git";
+import * as path from "path";
+import * as fs from "fs";
 
 const WORKER_URL = "https://flare.frontier.sh";
 const GITHUB_CLIENT_ID = "Ov23liZYcWsgjBgJz5T5";
@@ -20,9 +29,16 @@ const DEFAULT_SETTINGS: FlareSettings = {
 export default class FlarePlugin extends Plugin {
 	settings: FlareSettings;
 	private git: SimpleGit;
+	private gitDir: string;
 
 	async onload() {
 		await this.loadSettings();
+
+		this.gitDir = path.join(
+			(this.app.vault.adapter as any).getBasePath(),
+			".obsidian",
+			"flare-git"
+		);
 
 		this.addCommand({
 			id: "publish-post",
@@ -32,8 +48,45 @@ export default class FlarePlugin extends Plugin {
 
 		this.addSettingTab(new FlareSettingTab(this.app, this));
 
-		if (this.settings.githubToken) {
-			await this.initGit();
+		// Only initialize git if the directory exists and we have a token
+		if (this.settings.githubToken && fs.existsSync(this.gitDir)) {
+			this.git = simpleGit({
+				baseDir: this.gitDir,
+			});
+		}
+	}
+
+	async resetGitDirectory() {
+		if (fs.existsSync(this.gitDir)) {
+			fs.rmSync(this.gitDir, { recursive: true, force: true });
+		}
+		fs.mkdirSync(this.gitDir, { recursive: true });
+	}
+
+	async initGit() {
+		if (!fs.existsSync(this.gitDir)) {
+			fs.mkdirSync(this.gitDir, { recursive: true });
+		}
+
+		this.git = simpleGit({
+			baseDir: this.gitDir,
+		});
+
+		// Initialize fresh repo
+		await this.git.init();
+		await this.git.addRemote(
+			"origin",
+			`https://github.com/${this.settings.repositoryOwner}/${this.settings.repositoryName}.git`
+		);
+
+		await this.git.addConfig("user.name", "Flare by Frontier.sh");
+		await this.git.addConfig("user.email", "flare@frontier.sh");
+
+		try {
+			await this.git.fetch("origin");
+			await this.git.checkout("main");
+		} catch (e) {
+			await this.git.checkout(["-b", "main"]);
 		}
 	}
 
@@ -49,35 +102,31 @@ export default class FlarePlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	async initGit() {
-		const basePath = (this.app.vault.adapter as any).getBasePath();
-		this.git = simpleGit({
-			baseDir: basePath,
-		});
+	private async getChangedMarkdownFiles(): Promise<TFile[]> {
+		const vault = this.app.vault;
+		const files = vault.getMarkdownFiles();
+		const changedFiles: TFile[] = [];
 
-		try {
-			// Check if git is initialized
-			await this.git.revparse(["--git-dir"]);
-		} catch {
-			// If not, initialize git and set up the remote
-			await this.git.init();
-			await this.git.addRemote(
-				"origin",
-				`https://github.com/${this.settings.repositoryOwner}/${this.settings.repositoryName}.git`
-			);
+		for (const file of files) {
+			const vaultPath = file.path;
+			const gitPath = path.join(this.gitDir, vaultPath);
 
-			// Set up initial commit if needed
-			try {
-				await this.git.add(".gitignore");
-				await this.git.commit("Initial commit");
-			} catch {
-				// If commit fails, it's okay - might mean there's no .gitignore
+			// If file doesn't exist in git, it's new
+			if (!fs.existsSync(gitPath)) {
+				changedFiles.push(file);
+				continue;
 			}
 
-			// Configure git user
-			await this.git.addConfig("user.name", "Flare");
-			await this.git.addConfig("user.email", "flare@frontier.sh");
+			// Compare file content
+			const vaultContent = await vault.read(file);
+			const gitContent = fs.readFileSync(gitPath, "utf8");
+
+			if (vaultContent !== gitContent) {
+				changedFiles.push(file);
+			}
 		}
+
+		return changedFiles;
 	}
 
 	async publishPost() {
@@ -87,31 +136,122 @@ export default class FlarePlugin extends Plugin {
 		}
 
 		try {
-			const activeFile = this.app.workspace.getActiveFile();
-			if (!activeFile) {
-				new Notice("No active file to publish");
+			const changedFiles = await this.getChangedMarkdownFiles();
+
+			if (changedFiles.length === 0) {
+				new Notice("No changes to publish");
 				return;
 			}
 
-			// Ensure we're on main branch and have latest changes
+			// First, fetch to make sure we have latest remote info
+			await this.git.fetch("origin");
+
+			// Get the default branch from GitHub API
+			const repoResponse = await fetch(
+				`https://api.github.com/repos/${this.settings.repositoryOwner}/${this.settings.repositoryName}`,
+				{
+					headers: {
+						Authorization: `Bearer ${this.settings.githubToken}`,
+						Accept: "application/vnd.github.v3+json",
+					},
+				}
+			);
+
+			if (!repoResponse.ok) {
+				throw new Error("Failed to get repository information");
+			}
+
+			const repoInfo = await repoResponse.json();
+			const defaultBranch = repoInfo.default_branch;
+
+			// Check if the repository is empty by trying to get the default branch
+			const branchResponse = await fetch(
+				`https://api.github.com/repos/${this.settings.repositoryOwner}/${this.settings.repositoryName}/branches/${defaultBranch}`,
+				{
+					headers: {
+						Authorization: `Bearer ${this.settings.githubToken}`,
+						Accept: "application/vnd.github.v3+json",
+					},
+				}
+			);
+
+			const isEmpty = !branchResponse.ok; // If we can't get the branch, repo is empty
+
+			if (isEmpty) {
+				try {
+					// Try to switch to the default branch if it exists
+					await this.git.checkout(defaultBranch);
+				} catch {
+					// If it doesn't exist, create it
+					await this.git.checkout(["-b", defaultBranch]);
+				}
+
+				// Copy and add all changed files
+				for (const file of changedFiles) {
+					const fileContent = await this.app.vault.read(file);
+					const targetPath = path.join(this.gitDir, file.path);
+					const targetDir = path.dirname(targetPath);
+
+					if (!fs.existsSync(targetDir)) {
+						fs.mkdirSync(targetDir, { recursive: true });
+					}
+
+					fs.writeFileSync(targetPath, fileContent);
+					await this.git.add(file.path);
+				}
+
+				await this.git.commit("Initial commit");
+				await this.git.push("origin", defaultBranch);
+
+				new Notice(`Created first commit on ${defaultBranch}`);
+				return;
+			}
+
+			// For non-empty repos, continue with normal PR flow
 			try {
-				await this.git.fetch("origin");
-				await this.git.checkout("main");
-				await this.git.pull("origin", "main");
+				await this.git.checkout(defaultBranch);
+				await this.git.pull("origin", defaultBranch);
 			} catch (e) {
-				// If main branch doesn't exist yet, create it
-				await this.git.checkout(["-b", "main"]);
+				// If checkout fails, force create tracking branch
+				try {
+					await this.git.checkout([
+						"-B",
+						defaultBranch,
+						`origin/${defaultBranch}`,
+					]);
+				} catch {
+					// If that fails too, just create the branch
+					await this.git.checkout(["-B", defaultBranch]);
+				}
 			}
 
 			const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 			const branchName = `post-${timestamp}`;
 
-			// Create and checkout new branch
-			await this.git.checkoutLocalBranch(branchName);
+			// Create new branch
+			await this.git.checkout(["-b", branchName]);
 
-			// Stage and commit changes
-			await this.git.add(activeFile.path);
-			const commitMessage = `Add blog post: ${activeFile.basename}`;
+			// Copy all changed files to git directory
+			for (const file of changedFiles) {
+				const fileContent = await this.app.vault.read(file);
+				const targetPath = path.join(this.gitDir, file.path);
+				const targetDir = path.dirname(targetPath);
+
+				if (!fs.existsSync(targetDir)) {
+					fs.mkdirSync(targetDir, { recursive: true });
+				}
+
+				fs.writeFileSync(targetPath, fileContent);
+				await this.git.add(file.path);
+			}
+
+			// Create commit with all changes
+			const fileNames = changedFiles.map((f) => f.basename).join(", ");
+			const commitMessage =
+				changedFiles.length === 1
+					? `Update post: ${fileNames}`
+					: `Update posts: ${fileNames}`;
+
 			await this.git.commit(commitMessage);
 			await this.git.push("origin", branchName);
 
@@ -128,20 +268,23 @@ export default class FlarePlugin extends Plugin {
 					body: JSON.stringify({
 						title: commitMessage,
 						head: branchName,
-						base: "main",
-						body: "Created via Flare",
+						base: defaultBranch,
+						body: `Updated ${changedFiles.length} file(s) via Flare`,
 						auto_merge: true,
 					}),
 				}
 			);
 
 			if (!prResponse.ok) {
+				const errorData = await prResponse.json();
 				throw new Error(
-					`Failed to create PR: ${await prResponse.text()}`
+					`Failed to create PR: ${JSON.stringify(errorData)}`
 				);
 			}
 
-			new Notice("Successfully created PR with auto-merge enabled");
+			new Notice(
+				`Successfully created PR with ${changedFiles.length} file(s)`
+			);
 		} catch (error) {
 			new Notice(`Failed to publish: ${error.message}`);
 			console.error("Publishing error:", error);
@@ -170,8 +313,6 @@ class FlareSettingTab extends PluginSettingTab {
 						const state = crypto.randomUUID();
 						this.plugin.settings.state = state;
 						this.plugin.saveSettings();
-
-						// Open web app directly for auth and repo selection
 						window.open(
 							`${WORKER_URL}/?client=obsidian&state=${state}`,
 							"_blank"
@@ -187,6 +328,8 @@ class FlareSettingTab extends PluginSettingTab {
 				)
 				.addButton((button) =>
 					button.setButtonText("Disconnect").onClick(async () => {
+						// Reset everything on disconnect
+						await this.plugin.resetGitDirectory();
 						this.plugin.settings.githubToken = "";
 						this.plugin.settings.repositoryOwner = "";
 						this.plugin.settings.repositoryName = "";
@@ -205,6 +348,15 @@ class FlareSettingTab extends PluginSettingTab {
 				);
 				if (response.ok) {
 					const data = await response.json();
+
+					// Only reset if we're connecting to a different repo
+					if (
+						this.plugin.settings.repositoryOwner !== data.owner ||
+						this.plugin.settings.repositoryName !== data.repo
+					) {
+						await this.plugin.resetGitDirectory();
+					}
+
 					this.plugin.settings.githubToken = data.access_token;
 					this.plugin.settings.repositoryOwner = data.owner;
 					this.plugin.settings.repositoryName = data.repo;

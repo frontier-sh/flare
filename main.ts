@@ -7,11 +7,11 @@ import {
 	TFile,
 } from "obsidian";
 import simpleGit, { SimpleGit } from "simple-git";
+import * as YAML from 'yaml';
 import * as path from "path";
 import * as fs from "fs";
 
 const WORKER_URL = "https://flare.frontier.sh";
-
 const HUGO_POSTS_DIR = "content/posts";
 
 interface FlareSettings {
@@ -130,6 +130,50 @@ export default class FlarePlugin extends Plugin {
 		return changedFiles;
 	}
 
+	private async preprocessMarkdownContent(file: TFile, content: string): Promise<string> {
+		// Basic frontmatter detection
+		const frontmatterRegex = /^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/;
+		const match = content.match(frontmatterRegex);
+		
+		let frontmatter: Record<string, any> = {};
+		let postContent = content;
+	
+		if (match) {
+			// Parse existing frontmatter
+			try {
+				frontmatter = YAML.parse(match[1]);
+				postContent = match[2];
+			} catch (e) {
+				console.error("Error parsing frontmatter:", e);
+			}
+		}
+	
+		// Ensure required fields
+		if (!frontmatter.title) {
+			// Remove file extension and convert kebab/snake case to title case
+			frontmatter.title = file.basename
+				.replace(/[-_]/g, ' ')
+				.split(' ')
+				.map(word => word.charAt(0).toUpperCase() + word.slice(1))
+				.join(' ');
+		}
+	
+		if (!frontmatter.date) {
+			// Use file creation time, formatted as YYYY-MM-DD
+			const stat = await this.app.vault.adapter.stat(file.path);
+			if (stat) {
+				frontmatter.date = new Date(stat.ctime).toISOString().split('T')[0];
+			} else {
+				// Fallback to current date if stat is null
+				frontmatter.date = new Date().toISOString().split('T')[0];
+			}
+		}
+	
+		// Reconstruct the file content with ensured frontmatter
+		const newFrontmatter = '---\n' + YAML.stringify(frontmatter) + '---\n';
+		return newFrontmatter + postContent;
+	}
+
 	async publishPost() {
 		if (!this.settings.githubToken) {
 			new Notice("Please connect to GitHub first in the Flare settings");
@@ -190,6 +234,7 @@ export default class FlarePlugin extends Plugin {
 				// Copy and add all changed files
 				for (const file of changedFiles) {
 					const fileContent = await this.app.vault.read(file);
+					const processedContent = await this.preprocessMarkdownContent(file, fileContent);
 					const targetPath = path.join(this.gitDir, HUGO_POSTS_DIR, file.path);
 					const targetDir = path.dirname(targetPath);
 
@@ -197,7 +242,7 @@ export default class FlarePlugin extends Plugin {
 						fs.mkdirSync(targetDir, { recursive: true });
 					}
 
-					fs.writeFileSync(targetPath, fileContent);
+					fs.writeFileSync(targetPath, processedContent);
 					await this.git.add(path.join(HUGO_POSTS_DIR, file.path));
 				}
 
@@ -235,6 +280,7 @@ export default class FlarePlugin extends Plugin {
 			// Copy all changed files to git directory
 			for (const file of changedFiles) {
 				const fileContent = await this.app.vault.read(file);
+				const processedContent = await this.preprocessMarkdownContent(file, fileContent);
 				const targetPath = path.join(this.gitDir, HUGO_POSTS_DIR, file.path);
 				const targetDir = path.dirname(targetPath);
 
@@ -242,7 +288,7 @@ export default class FlarePlugin extends Plugin {
 					fs.mkdirSync(targetDir, { recursive: true });
 				}
 
-				fs.writeFileSync(targetPath, fileContent);
+				fs.writeFileSync(targetPath, processedContent);
 				await this.git.add(path.join(HUGO_POSTS_DIR, file.path));
 			}
 

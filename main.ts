@@ -11,7 +11,8 @@ import * as path from "path";
 import * as fs from "fs";
 
 const WORKER_URL = "https://flare.frontier.sh";
-const GITHUB_CLIENT_ID = "Ov23liZYcWsgjBgJz5T5";
+
+const HUGO_POSTS_DIR = "content/posts";
 
 interface FlareSettings {
 	githubToken: string;
@@ -189,7 +190,7 @@ export default class FlarePlugin extends Plugin {
 				// Copy and add all changed files
 				for (const file of changedFiles) {
 					const fileContent = await this.app.vault.read(file);
-					const targetPath = path.join(this.gitDir, file.path);
+					const targetPath = path.join(this.gitDir, HUGO_POSTS_DIR, file.path);
 					const targetDir = path.dirname(targetPath);
 
 					if (!fs.existsSync(targetDir)) {
@@ -197,7 +198,7 @@ export default class FlarePlugin extends Plugin {
 					}
 
 					fs.writeFileSync(targetPath, fileContent);
-					await this.git.add(file.path);
+					await this.git.add(path.join(HUGO_POSTS_DIR, file.path));
 				}
 
 				await this.git.commit("Initial commit");
@@ -234,7 +235,7 @@ export default class FlarePlugin extends Plugin {
 			// Copy all changed files to git directory
 			for (const file of changedFiles) {
 				const fileContent = await this.app.vault.read(file);
-				const targetPath = path.join(this.gitDir, file.path);
+				const targetPath = path.join(this.gitDir, HUGO_POSTS_DIR, file.path);
 				const targetDir = path.dirname(targetPath);
 
 				if (!fs.existsSync(targetDir)) {
@@ -242,7 +243,7 @@ export default class FlarePlugin extends Plugin {
 				}
 
 				fs.writeFileSync(targetPath, fileContent);
-				await this.git.add(file.path);
+				await this.git.add(path.join(HUGO_POSTS_DIR, file.path));
 			}
 
 			// Create commit with all changes
